@@ -24,23 +24,81 @@
 
 
 import subprocess
+import os
 import os.path
+import win32api
 import argparse
 import shutil
+import winreg
+import re
 
-# The mingw path matches where Fedora 21 installs mingw32
-default_path_prefixes = [
-    "", "/usr/bin", "/usr/i686-w64-mingw32/sys-root/mingw/bin", "/mingw64/bin",
-]
-
-# This blacklist may need extending
+# List of system dlls which do not need to be packaged with exe
 blacklist = [
-    "advapi32.dll", "kernel32.dll", "msvcrt.dll", "ole32.dll", "user32.dll",
-    "ws2_32.dll", "comdlg32.dll", "gdi32.dll", "imm32.dll", "oleaut32.dll",
-    "shell32.dll", "winmm.dll", "winspool.drv", "wldap32.dll",
-    "ntdll.dll", "d3d9.dll", "mpr.dll", "crypt32.dll", "dnsapi.dll",
-    "shlwapi.dll", "version.dll", "iphlpapi.dll",
+    "crypt32.dll", "d3d9.dll", "dnsapi.dll", "mpr.dll", "ntdll.dll",
+    "iphlpapi.dll", "version.dll", "winmm.dll", "winspool.drv", "wsock32.dll"
 ]
+
+
+def get_dll_search_order():
+    search_order = []
+    aReg = winreg.ConnectRegistry(None,winreg.HKEY_LOCAL_MACHINE)
+    aKey = winreg.OpenKey(aReg, r"SYSTEM\CurrentControlSet\Control\Session Manager")
+    try:
+        safeDllMode,t = winreg.QueryValueEx(aKey, "SafeDllSearchMode")
+    except FileNotFoundError:
+        safeDllMode = 1
+    winreg.CloseKey(aKey)
+    winreg.CloseKey(aReg)
+
+    if safeDllMode:
+        search_order.append("")
+        search_order.append(win32api.GetSystemDirectory())
+        search_order.append(win32api.GetWindowsDirectory())
+        search_order.append(".")
+    else:
+        search_order.append("")
+        search_order.append(".")
+        search_order.append(win32api.GetSystemDirectory())
+        search_order.append(win32api.GetWindowsDirectory())
+
+    search_order.extend(os.environ["PATH"].split(";"))
+
+    return search_order
+
+
+def expand_env_values(s):
+    pat = re.compile("(%\w+%)")
+    m = pat.match(s)
+    while m:
+        env_var = m.group(1)
+        env_var_s = env_var[1:-1]
+        try:
+            env_val = os.environ[env_var_s]
+        except KeyError:
+            env_val = ""
+        s = s.replace(env_var,env_val)
+        m = pat.match(s)
+    return s
+
+
+def get_known_dlls():
+    aReg = winreg.ConnectRegistry(None,winreg.HKEY_LOCAL_MACHINE)
+    aKey = winreg.OpenKey(aReg, r"SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs")
+    dlls = []
+    done = False
+    i = 0
+    while not done:
+        try:
+            n,v,t = winreg.EnumValue(aKey,i)
+            if "DllDirectory" not in n:
+                v = expand_env_values(v)
+                dlls.append(v.lower())
+            i += 1
+        except OSError:
+            done = True
+    winreg.CloseKey(aKey)
+    winreg.CloseKey(aReg)
+    return dlls
 
 
 def find_full_path(filename, path_prefixes):
@@ -63,17 +121,25 @@ def find_full_path(filename, path_prefixes):
     return path
 
 
-def gather_deps(path, path_prefixes, seen):
+def gather_deps(path, path_prefixes, known_dlls, seen):
     ret = [path]
     output = subprocess.check_output(["objdump", "-p", path]).decode('utf-8').split("\n")
     for line in output:
-        if not line.startswith("\tDLL Name: "):
+        ldep = None
+
+        if line.startswith("\tDLL Name: "):
+            dep = line.split("DLL Name: ")[1].strip()
+            ldep = dep.lower()
+
+        m = re.match(".+Forwarder RVA -- (\w+).", line)
+        if m:
+            dep = m.group(1) + ".dll"
+            ldep = dep.lower()
+
+        if ldep == None:
             continue
 
-        dep = line.split("DLL Name: ")[1].strip()
-        ldep = dep.lower()
-
-        if ldep in blacklist:
+        if ldep in known_dlls:
             continue
 
         if ldep in seen:
@@ -81,7 +147,7 @@ def gather_deps(path, path_prefixes, seen):
 
         dep_path = find_full_path(dep, path_prefixes)
         seen.extend([ldep])
-        subdeps = gather_deps(dep_path, path_prefixes, seen)
+        subdeps = gather_deps(dep_path, path_prefixes, known_dlls, seen)
         ret.extend(subdeps)
 
     return ret
@@ -108,7 +174,10 @@ def main():
     if args.upx and not args.copy:
         raise RuntimeError("Can't run UPX if --copy hasn't been provided.")
 
-    all_deps = set(gather_deps(args.exe_file, default_path_prefixes, []))
+    known_dlls = get_known_dlls()
+    known_dlls.extend(blacklist)
+
+    all_deps = set(gather_deps(args.exe_file, get_dll_search_order(), known_dlls, []))
     all_deps.remove(args.exe_file)
 
     print("\n".join(all_deps))
